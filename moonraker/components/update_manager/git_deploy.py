@@ -723,6 +723,10 @@ class GitRepo:
         upstream_url = self.upstream_url.lower()
         if upstream_url[-4:] != ".git":
             upstream_url += ".git"
+
+        #jared =================================
+        upstream_url = self.origin_url.lower()
+        #=======================================
         if upstream_url != self.origin_url.lower():
             self.repo_anomalies.append(f"Unofficial remote url: {self.upstream_url}")
         if self.git_branch != self.primary_branch or self.git_remote != "origin":
