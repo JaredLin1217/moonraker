@@ -352,6 +352,39 @@ class MQTTClient(APITransport):
                 "between 0 and 2")
         self.publish_split_status = \
             config.getboolean("publish_split_status", False)
+
+        # ThingsBoard direct mode configuration
+        self.thingsboard_mode: bool = config.getboolean("thingsboard_mode", False)
+        if self.thingsboard_mode:
+            self.tb_telemetry_topic = "v1/devices/me/telemetry"
+            self.tb_attributes_topic = "v1/devices/me/attributes"
+            self.tb_rpc_sub_topic = "v1/devices/me/rpc/request/+"
+            self.tb_rpc_pub_topic = "v1/devices/me/rpc/response/"
+            self.tb_flush_interval: float = config.getfloat("tb_flush_interval", 1.0)
+            self.tb_buffer: Dict[str, Any] = {}
+            self.tb_last_flush: float = 0.0
+            self.tb_rpc_prefix = "v1/devices/me/rpc/request/"
+            # RPC method mapping: TB method -> Moonraker JSON-RPC method
+            self.tb_rpc_methods: Dict[str, str] = {
+                "start_print": "printer.print.start",
+                "pause_print": "printer.print.pause",
+                "resume_print": "printer.print.resume",
+                "cancel_print": "printer.print.cancel",
+                "emergency_stop": "printer.emergency_stop",
+                "gcode_script": "printer.gcode.script",
+                "list_files": "server.files.list",
+            }
+            logging.info(
+                "MQTT: ThingsBoard mode enabled, flush interval: "
+                f"{self.tb_flush_interval}s"
+            )
+            # --- TB resilience: connection state + offline cache ---
+            self.tb_connected: bool = False
+            self.tb_offline_cache: deque = deque(maxlen=10000)
+            _cache_dir = pathlib.Path.home() / "printer_data" / "cache"
+            self.tb_cache_file: str = str(_cache_dir / "tb_offline_cache.json")
+            self._tb_load_disk_cache()
+
         client_id: str = config.get("client_id", "")
         if PAHO_MQTT_VERSION < (2, 0):
             self.client = ExtPahoClient(client_id, protocol=self.protocol)
@@ -477,6 +510,11 @@ class MQTTClient(APITransport):
                     message: paho_mqtt.MQTTMessage
                     ) -> None:
         topic = message.topic
+        # Handle ThingsBoard RPC requests
+        if self.thingsboard_mode and topic.startswith(self.tb_rpc_prefix):
+            self.eventloop.register_callback(
+                self._handle_tb_rpc, topic, message.payload)
+            return
         if topic in self.subscribed_topics:
             cb_hdls = self.subscribed_topics[topic][1]
             for hdl in cb_hdls:
@@ -507,6 +545,15 @@ class MQTTClient(APITransport):
                     sub_fut.add_done_callback(
                         BrokerAckLogger(topics, "subscribe"))
                     self.pending_acks[msg_id] = sub_fut
+            # Subscribe to ThingsBoard RPC topic (wildcard)
+            if self.thingsboard_mode:
+                client.subscribe(self.tb_rpc_sub_topic, 1)
+                logging.info(
+                    f"MQTT: Subscribed to TB RPC topic: {self.tb_rpc_sub_topic}"
+                )
+                self.tb_connected = True
+                if self.tb_offline_cache:
+                    self.eventloop.register_callback(self._tb_flush_cache)
             self.connect_evt.set()
             self.server.send_event("mqtt:connected")
         else:
@@ -516,6 +563,9 @@ class MQTTClient(APITransport):
                 err_str = reason_code.getName()
             self.server.set_failed_component("mqtt")
             self.server.add_warning(f"MQTT Connection Failed: {err_str}")
+            if self.thingsboard_mode:
+                # rc=3 broker-unavailable 是暂态错误，30s 后强制重试
+                self.eventloop.delay_callback(30., self._tb_start_reconnect)
 
     def _on_disconnect(self,
                        client: paho_mqtt.Client,
@@ -532,6 +582,8 @@ class MQTTClient(APITransport):
             if self.connect_task is None:
                 self.connect_task = self.eventloop.create_task(self._do_reconnect())
             self.server.send_event("mqtt:disconnected")
+        if self.thingsboard_mode:
+            self.tb_connected = False
         self.connect_evt.clear()
 
     def _on_publish(self,
@@ -810,6 +862,12 @@ class MQTTClient(APITransport):
         return eventtime + self.status_interval
 
     def _publish_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
+        # ThingsBoard mode: aggregate and publish to TB telemetry topic
+        if self.thingsboard_mode:
+            self._publish_tb_telemetry(status, eventtime)
+            return
+
+        # Original logic for non-TB mode
         if self.publish_split_status:
             for objkey in status:
                 objval = status[objkey]
@@ -823,11 +881,202 @@ class MQTTClient(APITransport):
             payload = {'eventtime': eventtime, 'status': status}
             self.publish_topic(self.klipper_status_topic, payload)
 
+    async def _handle_tb_rpc(self, topic: str, payload: bytes) -> None:
+        """Handle ThingsBoard server-side RPC request"""
+        request_id = topic.split("/")[-1]
+        try:
+            data = jsonw.loads(payload)
+            tb_method = data.get("method", "")
+            tb_params = data.get("params", {})
+            logging.info(
+                f"MQTT: TB RPC request #{request_id}: "
+                f"method={tb_method}, params={tb_params}")
+
+            # Map TB method to Moonraker JSON-RPC method
+            moonraker_method = self.tb_rpc_methods.get(tb_method, tb_method)
+
+            # Build Moonraker JSON-RPC request
+            rpc_request: Dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "method": moonraker_method,
+                "id": int(request_id),
+            }
+
+            # Handle params based on method
+            if tb_method == "start_print":
+                fn = (
+                    tb_params if isinstance(tb_params, str)
+                    else tb_params.get("filename", "")
+                )
+                rpc_request["params"] = {"filename": fn}
+            elif tb_method == "gcode_script":
+                sc = (
+                    tb_params if isinstance(tb_params, str)
+                    else tb_params.get("script", "")
+                )
+                rpc_request["params"] = {"script": sc}
+            elif tb_method == "list_files":
+                rpc_request["params"] = {"root": "gcodes"}
+            elif (
+                tb_method not in (
+                    "pause_print", "resume_print", "cancel_print",
+                    "emergency_stop"
+                )
+                and isinstance(tb_params, dict)
+                and tb_params
+            ):
+                rpc_request["params"] = tb_params
+
+            # Dispatch to Moonraker JSON-RPC
+            rpc: JsonRPC = self.server.lookup_component("jsonrpc")
+            rpc_payload = jsonw.dumps(rpc_request)
+            response = await rpc.dispatch(rpc_payload, self)
+
+            # Send response back to ThingsBoard
+            resp_topic = f"{self.tb_rpc_pub_topic}{request_id}"
+            if response is not None:
+                resp_data = jsonw.loads(response) if isinstance(
+                    response, (str, bytes)) else response
+                tb_response = resp_data.get("result", resp_data)
+                # ThingsBoard expects JSON object, wrap non-dict/list responses
+                if isinstance(tb_response, list):
+                    tb_response = {"result": tb_response}
+                elif not isinstance(tb_response, dict):
+                    tb_response = {"success": True}
+            else:
+                tb_response = {"success": True}
+
+            await self.publish_topic(resp_topic, tb_response, qos=1)
+            logging.info(f"MQTT: TB RPC response #{request_id} sent")
+
+        except Exception as e:
+            logging.exception(f"MQTT: TB RPC error: {e}")
+            try:
+                resp_topic = f"{self.tb_rpc_pub_topic}{request_id}"
+                await self.publish_topic(
+                    resp_topic, {"error": str(e)}, qos=1)
+            except Exception:
+                pass
+
+    def _publish_tb_telemetry(self, status: Dict[str, Any], eventtime: float) -> None:
+        """Publish telemetry data in ThingsBoard format"""
+        import time as _time
+
+        # Known list fields to flatten with suffix mapping
+        _LIST_SUFFIXES = {
+            "position": ["pos_x", "pos_y", "pos_z", "pos_e"],
+            "axis_minimum": ["axis_min_x", "axis_min_y", "axis_min_z", "axis_min_e"],
+            "axis_maximum": ["axis_max_x", "axis_max_y", "axis_max_z", "axis_max_e"],
+        }
+
+        # Flatten status data into buffer
+        for obj_name, obj_data in status.items():
+            if isinstance(obj_data, dict):
+                for key, value in obj_data.items():
+                    if isinstance(value, list):
+                        suffixes = _LIST_SUFFIXES.get(key)
+                        if suffixes:
+                            for i, suffix in enumerate(suffixes):
+                                if i < len(value):
+                                    self.tb_buffer[f"{obj_name}_{suffix}"] = value[i]
+                        continue
+                    if isinstance(value, dict):
+                        continue
+                    tb_key = f"{obj_name}_{key}"
+                    self.tb_buffer[tb_key] = value
+
+        # Flush buffer based on interval
+        now = _time.time()
+        if now - self.tb_last_flush >= self.tb_flush_interval and self.tb_buffer:
+            payload = {
+                "ts": int(_time.time() * 1000),
+                "values": self.tb_buffer.copy()
+            }
+            if self.tb_connected:
+                self.publish_topic(self.tb_telemetry_topic, payload, qos=1)
+            else:
+                self.tb_offline_cache.append(payload)
+                if len(self.tb_offline_cache) % 60 == 0:
+                    logging.warning(
+                        "MQTT: TB offline, "
+                        f"{len(self.tb_offline_cache)} messages cached"
+                    )
+            self.tb_buffer.clear()
+            self.tb_last_flush = now
+
+    # ── TB resilience helpers ────────────────────────────────────
+
+    def _tb_load_disk_cache(self) -> None:
+        """启动时从磁盘加载离线缓存。"""
+        import json as _json
+        try:
+            p = pathlib.Path(self.tb_cache_file)
+            if not p.exists():
+                return
+            items = _json.loads(p.read_text())
+            if isinstance(items, list):
+                for item in items[-10000:]:
+                    self.tb_offline_cache.append(item)
+            p.unlink()
+            logging.info(
+                "MQTT: Loaded "
+                f"{len(self.tb_offline_cache)} cached TB messages from disk"
+            )
+        except Exception as e:
+            logging.warning(f"MQTT: TB cache load failed: {e}")
+
+    def _tb_save_disk_cache(self) -> None:
+        """关闭时将内存缓存持久化到磁盘。"""
+        import json as _json
+        if not self.tb_offline_cache:
+            pathlib.Path(self.tb_cache_file).unlink(missing_ok=True)
+            return
+        try:
+            p = pathlib.Path(self.tb_cache_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_json.dumps(list(self.tb_offline_cache)))
+            logging.info(
+                f"MQTT: Persisted {len(self.tb_offline_cache)} TB messages to disk")
+        except Exception as e:
+            logging.warning(f"MQTT: TB cache save failed: {e}")
+
+    async def _tb_flush_cache(self) -> None:
+        """重连成功后将离线缓存批量补发至 ThingsBoard。"""
+        if not self.tb_offline_cache:
+            return
+        count = len(self.tb_offline_cache)
+        logging.info(f"MQTT: Flushing {count} cached TB messages after reconnect")
+        sent = 0
+        while self.tb_offline_cache and self.tb_connected:
+            payload = self.tb_offline_cache.popleft()
+            try:
+                await self.publish_topic(
+                    self.tb_telemetry_topic, payload, qos=1)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                self.tb_offline_cache.appendleft(payload)
+                logging.warning(f"MQTT: TB cache flush error: {e}")
+                break
+        logging.info(
+            f"MQTT: Cache flush done: sent={sent}, "
+            f"remaining={len(self.tb_offline_cache)}"
+        )
+
+    def _tb_start_reconnect(self) -> None:
+        """rc=3 broker-unavailable 后强制重启重连流程。"""
+        if self.is_connected() or self.connect_task is not None:
+            return
+        logging.info("MQTT: TB forcing reconnect after broker-unavailable")
+        self.connect_task = self.eventloop.create_task(self._do_reconnect())
+
 
     def get_instance_name(self) -> str:
         return self.instance_name
 
     async def close(self) -> None:
+        if self.thingsboard_mode:
+            self._tb_save_disk_cache()
         if self.status_update_timer is not None:
             self.status_update_timer.stop()
         if self.connect_task is not None:
