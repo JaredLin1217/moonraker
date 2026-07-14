@@ -21,6 +21,7 @@ from typing import (
     Any,
     Dict,
     List,
+    NoReturn,
     Optional,
     Set,
     Tuple,
@@ -68,6 +69,7 @@ SCAN_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 30.0
 CHECKPOINT_TIMEOUT = 45
 RECOVERY_TIMEOUT = 15.0
+PASSIVE_REFRESH_DELAY = .25
 
 CONNECTIVITY_STATES = {
     0: "unknown",
@@ -116,9 +118,21 @@ class WifiManager:
 
         self._interface_cache: Dict[Tuple[str, str], ProxyInterface] = {}
         self._property_handlers: List[Tuple[ProxyInterface, Any]] = []
+        self._signal_handlers: List[Tuple[ProxyInterface, str, Any]] = []
+        self._ap_property_handlers: Dict[
+            str, Tuple[ProxyInterface, Any]
+        ] = {}
+        self._ip4_property_handler: Optional[
+            Tuple[str, ProxyInterface, Any]
+        ] = None
         self._operation_lock = asyncio.Lock()
+        self._snapshot_lock = asyncio.Lock()
+        self._watcher_lock = asyncio.Lock()
+        self._desired_ap_paths: Set[str] = set()
+        self._desired_ip4_path: Optional[str] = None
         self._operation_task: Optional[asyncio.Task] = None
         self._notify_task: Optional[asyncio.Task] = None
+        self._refresh_pending = False
         self._closed = False
         self._last_scan_at = 0.0
         self._networks: List[Dict[str, Any]] = []
@@ -145,6 +159,9 @@ class WifiManager:
         )
         self.server.register_notification(
             "machine:wifi_state_changed", local_only=True
+        )
+        self.server.register_notification(
+            "machine:wifi_networks_changed", local_only=True
         )
 
     async def component_init(self) -> None:
@@ -175,18 +192,48 @@ class WifiManager:
             self.settings = await self._get_interface(
                 NM_SETTINGS_PATH, NM_SETTINGS_IFACE
             )
-            self.device_path = await self.nm.call_get_device_by_ip_iface(
-                self.interface
-            )
+            get_device = self.nm.call_get_device_by_ip_iface  # type: ignore
+            self.device_path = await get_device(self.interface)
+            assert self.device_path is not None
             self.device = await self._get_interface(
                 self.device_path, NM_DEVICE_IFACE
             )
             self.wifi = await self._get_interface(self.device_path, NM_WIFI_IFACE)
             await self._watch_properties(NM_PATH)
             await self._watch_properties(self.device_path)
+            self._watch_signal(
+                self.wifi, "access_point_added", self._on_access_point_added
+            )
+            self._watch_signal(
+                self.wifi, "access_point_removed", self._on_access_point_removed
+            )
+            self._watch_signal(
+                self.settings, "new_connection", self._on_connection_added
+            )
+            self._watch_signal(
+                self.settings,
+                "connection_removed",
+                self._on_connection_removed,
+            )
+            await self._refresh_network_snapshot(
+                emit=False, preserve_on_failure=True
+            )
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            # Initialization is not retried.  Stop callbacks before disabling
+            # the adapter so a partially installed signal set cannot continue
+            # scheduling work for the lifetime of the component.
+            self._closed = True
+            notify_task = self._notify_task
+            if notify_task is not None:
+                if not notify_task.done():
+                    notify_task.cancel()
+                try:
+                    await notify_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await self._remove_dbus_handlers()
             logging.info(
                 "[wifi_manager]: Unable to initialize NetworkManager adapter %s: %s",
                 self.interface, self._safe_dbus_message(err)
@@ -211,12 +258,29 @@ class WifiManager:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        await self._remove_dbus_handlers()
+        self._refresh_pending = False
+
+    async def _remove_dbus_handlers(self) -> None:
+        self._desired_ap_paths.clear()
+        self._desired_ip4_path = None
         for props, callback in self._property_handlers:
             try:
                 props.off_properties_changed(callback)  # type: ignore
             except Exception:
                 pass
         self._property_handlers.clear()
+        async with self._watcher_lock:
+            for path in list(self._ap_property_handlers):
+                self._unwatch_access_point(path)
+            self._unwatch_ipv4_config()
+        for interface, off_method, callback in self._signal_handlers:
+            try:
+                getattr(interface, off_method)(callback)
+            except Exception:
+                pass
+        self._signal_handlers.clear()
+        self._interface_cache.clear()
 
     async def _get_interface(self, path: str, name: str) -> ProxyInterface:
         key = (path, name)
@@ -227,11 +291,147 @@ class WifiManager:
         self._interface_cache[key] = interface
         return interface
 
+    async def _get_transient_interface(
+        self, path: str, name: str
+    ) -> ProxyInterface:
+        # AccessPoint, ActiveConnection, and IP4Config objects may disappear at
+        # any time.  Keeping their proxy interfaces in the component cache can
+        # otherwise retain stale NetworkManager objects after an automatic roam.
+        return await self.dbus_mgr.get_interface(NM_BUS, path, name)
+
     async def _watch_properties(self, path: str) -> None:
         props = await self._get_interface(path, DBUS_PROPERTIES_IFACE)
         callback = self._on_properties_changed
         props.on_properties_changed(callback)  # type: ignore
         self._property_handlers.append((props, callback))
+
+    def _watch_signal(
+        self, interface: ProxyInterface, signal: str, callback: Any
+    ) -> None:
+        on_method = f"on_{signal}"
+        off_method = f"off_{signal}"
+        getattr(interface, on_method)(callback)
+        self._signal_handlers.append((interface, off_method, callback))
+
+    async def _sync_access_point_watchers(self, paths: List[str]) -> None:
+        if self._closed:
+            return
+        active_paths = set(paths)
+        # Keep a distinct set so add/remove signal handlers can invalidate this
+        # in-flight generation without mutating its comparison snapshot.
+        self._desired_ap_paths = set(active_paths)
+        async with self._watcher_lock:
+            if self._closed or active_paths != self._desired_ap_paths:
+                return
+            for path in set(self._ap_property_handlers) - active_paths:
+                self._unwatch_access_point(path)
+            for path in active_paths - set(self._ap_property_handlers):
+                try:
+                    props = await self._get_transient_interface(
+                        path, DBUS_PROPERTIES_IFACE
+                    )
+                    # A newer AP list or a removal signal may arrive while the
+                    # transient object is being introspected.  Never install a
+                    # handler from that superseded list.
+                    if self._closed or active_paths != self._desired_ap_paths:
+                        return
+                    callback = self._on_access_point_properties_changed
+                    props.on_properties_changed(callback)  # type: ignore
+                    self._ap_property_handlers[path] = (props, callback)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # An AP may vanish between GetAllAccessPoints and installing
+                    # its signal handler.  The next AP list signal will retry.
+                    continue
+
+    def _unwatch_access_point(self, path: str) -> None:
+        handler = self._ap_property_handlers.pop(path, None)
+        if handler is None:
+            return
+        props, callback = handler
+        try:
+            props.off_properties_changed(callback)  # type: ignore
+        except Exception:
+            pass
+
+    async def _sync_ipv4_watcher(self, path: Optional[str]) -> None:
+        if self._closed:
+            return
+        desired_path = path if path and path != "/" else None
+        self._desired_ip4_path = desired_path
+        async with self._watcher_lock:
+            if self._closed or desired_path != self._desired_ip4_path:
+                return
+            current = self._ip4_property_handler
+            if current is not None and current[0] == desired_path:
+                return
+            self._unwatch_ipv4_config()
+            if desired_path is None:
+                return
+            try:
+                props = await self._get_transient_interface(
+                    desired_path, DBUS_PROPERTIES_IFACE
+                )
+                # A concurrent status read may have observed a replacement
+                # IP4Config while introspection was in flight.
+                if self._closed or desired_path != self._desired_ip4_path:
+                    return
+                callback = self._on_ipv4_properties_changed
+                props.on_properties_changed(callback)  # type: ignore
+                self._ip4_property_handler = (
+                    desired_path, props, callback
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The IP4Config may be replaced while a lease is changing.  The
+                # corresponding Device properties signal will schedule a retry.
+                pass
+
+    def _unwatch_ipv4_config(self) -> None:
+        handler = self._ip4_property_handler
+        self._ip4_property_handler = None
+        if handler is None:
+            return
+        _, props, callback = handler
+        try:
+            props.off_properties_changed(callback)  # type: ignore
+        except Exception:
+            pass
+
+    def _on_access_point_added(self, path: str) -> None:
+        if self._closed:
+            return
+        self._desired_ap_paths.add(path)
+        self._schedule_notification()
+
+    def _on_access_point_removed(self, path: str) -> None:
+        if self._closed:
+            return
+        self._desired_ap_paths.discard(path)
+        self._unwatch_access_point(path)
+        self._interface_cache.pop((path, NM_AP_IFACE), None)
+        self._schedule_notification()
+
+    def _on_connection_added(self, path: str) -> None:
+        self._schedule_notification()
+
+    def _on_connection_removed(self, path: str) -> None:
+        self._interface_cache.pop((path, NM_CONNECTION_IFACE), None)
+        self._schedule_notification()
+
+    def _on_access_point_properties_changed(
+        self, interface: str, changed: Dict[str, Variant], invalidated: List[str]
+    ) -> None:
+        if interface == NM_AP_IFACE:
+            self._schedule_notification()
+
+    def _on_ipv4_properties_changed(
+        self, interface: str, changed: Dict[str, Variant], invalidated: List[str]
+    ) -> None:
+        if interface == NM_IP4_IFACE:
+            self._schedule_notification()
 
     def _on_properties_changed(
         self, interface: str, changed: Dict[str, Variant], invalidated: List[str]
@@ -243,19 +443,154 @@ class WifiManager:
     def _schedule_notification(self) -> None:
         if self._closed:
             return
+        self._refresh_pending = True
+        if self._is_busy():
+            return
         if self._notify_task is not None and not self._notify_task.done():
             return
         self._notify_task = self.server.get_event_loop().create_task(
-            self._emit_status_deferred()
+            self._drain_passive_refresh()
         )
 
-    async def _emit_status_deferred(self) -> None:
-        await asyncio.sleep(.15)
-        await self._emit_status()
+    def _resume_pending_refresh(self) -> None:
+        if self._refresh_pending and not self._closed and not self._is_busy():
+            self._schedule_notification()
 
-    async def _emit_status(self) -> None:
-        status = await self._get_status()
+    def _on_operation_done(self, task: asyncio.Task) -> None:
+        is_current = self._operation_task is task
+        if is_current:
+            self._operation_task = None
+        error: Optional[BaseException] = None
+        if not task.cancelled():
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                pass
+        if error is not None and not self._closed:
+            logging.error(
+                "[wifi_manager]: Unexpected Wi-Fi operation failure: %s",
+                self._safe_dbus_message(error),
+            )
+            operation = self._operation
+            if (
+                is_current and operation is not None and
+                operation.get("state") == "running"
+            ):
+                failure = WifiFailure(
+                    "internal_error",
+                    "NetworkManager could not complete the operation",
+                )
+                self._finish_operation(False, failure)
+                self._schedule_notification()
+        self._resume_pending_refresh()
+
+    async def _drain_passive_refresh(self) -> None:
+        try:
+            while self._refresh_pending and not self._closed:
+                await asyncio.sleep(PASSIVE_REFRESH_DELAY)
+                async with self._snapshot_lock:
+                    # The operation may have started while this task was asleep
+                    # or queued for the snapshot lock.  Leave the request pending
+                    # so the operation's completion callback drains it once.
+                    if self._is_busy():
+                        return
+                    self._refresh_pending = False
+                    await self._refresh_network_snapshot_locked(
+                        emit=True, preserve_on_failure=True
+                    )
+        finally:
+            self._notify_task = None
+            self._resume_pending_refresh()
+
+    def _network_snapshot(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "status": dict(status),
+            "networks": [dict(item) for item in self._networks],
+        }
+
+    def _send_network_snapshot(self, status: Dict[str, Any]) -> None:
+        self.server.send_event(
+            "machine:wifi_networks_changed",
+            self._network_snapshot(status),
+        )
+
+    def _reconcile_networks(self, status: Dict[str, Any]) -> bool:
+        connected_ssid = (
+            status.get("ssid") if status.get("connected") else None
+        )
+        connected_strength = status.get("strength")
+        networks: List[Dict[str, Any]] = []
+        for cached in self._networks:
+            network = dict(cached)
+            connected = bool(
+                connected_ssid is not None and
+                network.get("ssid") == connected_ssid
+            )
+            network["connected"] = connected
+            if connected and connected_strength is not None:
+                network["strength"] = int(connected_strength)
+            networks.append(network)
+        networks.sort(
+            key=lambda item: (
+                not item["connected"],
+                -item["strength"],
+                item["ssid"],
+            )
+        )
+        if networks == self._networks:
+            return False
+        self._networks = networks
+        return True
+
+    async def _refresh_network_snapshot(
+        self, *, emit: bool, preserve_on_failure: bool
+    ) -> Dict[str, Any]:
+        async with self._snapshot_lock:
+            return await self._refresh_network_snapshot_locked(
+                emit=emit, preserve_on_failure=preserve_on_failure
+            )
+
+    async def _refresh_network_snapshot_locked(
+        self, *, emit: bool, preserve_on_failure: bool
+    ) -> Dict[str, Any]:
+        status = await self._read_status()
+        changed = False
+        try:
+            networks = await self._read_networks(status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            if not preserve_on_failure:
+                raise
+            # Keep the last complete AP/profile snapshot.  Live connection flags
+            # may still be reconciled safely, and an operation error must not be
+            # replaced by a passive cache-read failure.
+            changed = self._reconcile_networks(status)
+            logging.info(
+                "[wifi_manager]: Unable to refresh the passive Wi-Fi cache: %s",
+                self._safe_dbus_message(err),
+            )
+        else:
+            previous_networks = self._networks
+            self._networks = networks
+            # The strongest AP returned for an SSID is not necessarily the AP
+            # NetworkManager is currently using.  Always apply the live status
+            # after rebuilding the cache so the atomic snapshot carries the
+            # active AP's strength as well as the correct connected row.
+            self._reconcile_networks(status)
+            changed = self._networks != previous_networks
+        if emit:
+            self.server.send_event("machine:wifi_state_changed", status)
+            if changed:
+                self._send_network_snapshot(status)
+        return self._network_snapshot(status)
+
+    async def _emit_status(self, force_snapshot: bool = False) -> None:
+        status = await self._read_status()
+        networks_changed = self._reconcile_networks(status)
         self.server.send_event("machine:wifi_state_changed", status)
+        if force_snapshot or networks_changed:
+            self._send_network_snapshot(status)
 
     def _check_local(self, web_request: WebRequest) -> None:
         ip_addr = web_request.get_ip_address()
@@ -275,7 +610,8 @@ class WifiManager:
             for obj in (self.nm, self.settings, self.device, self.wifi)
         ) or self.device_path is None:
             raise WifiFailure(
-                "adapter_unavailable", f"Wi-Fi adapter '{self.interface}' is unavailable"
+                "adapter_unavailable",
+                f"Wi-Fi adapter '{self.interface}' is unavailable",
             )
 
     def _ensure_permissions(self, *permissions: str) -> None:
@@ -289,7 +625,7 @@ class WifiManager:
         task = self._operation_task
         return self._operation_lock.locked() or (task is not None and not task.done())
 
-    def _raise_failure(self, failure: WifiFailure) -> None:
+    def _raise_failure(self, failure: WifiFailure) -> NoReturn:
         status = ERROR_HTTP_STATUS.get(failure.code, 500)
         raise self.server.error(f"{failure.code}: {failure.message}", status)
 
@@ -324,7 +660,20 @@ class WifiManager:
 
     async def _handle_status(self, web_request: WebRequest) -> Dict[str, Any]:
         self._check_local(web_request)
-        return await self._get_status()
+        # Status polling must remain responsive throughout a connect/forget
+        # operation, which intentionally owns the snapshot lock for its full
+        # lifetime.  The operation itself publishes the authoritative snapshots.
+        if self._is_busy():
+            return await self._read_status()
+        async with self._snapshot_lock:
+            # Re-check after waiting behind a passive/cooldown rebuild.  An
+            # operation accepted in the meantime must not be blocked here.
+            if self._is_busy():
+                return await self._read_status()
+            status = await self._read_status()
+            if self._reconcile_networks(status):
+                self._send_network_snapshot(status)
+            return status
 
     async def _handle_scan(self, web_request: WebRequest) -> Dict[str, Any]:
         self._check_local(web_request)
@@ -333,31 +682,43 @@ class WifiManager:
             self._ensure_permissions("scan")
             if self._is_busy():
                 raise WifiFailure("busy", "Another Wi-Fi operation is running")
-            elapsed = time.monotonic() - self._last_scan_at
-            if self._last_scan_at and elapsed < SCAN_INTERVAL:
-                return {
-                    "status": await self._get_status(),
-                    "networks": [dict(item) for item in self._networks],
-                }
-            async with self._operation_lock:
-                self._new_operation("scan", None)
-                await self._emit_status()
-                try:
-                    await self._request_scan()
-                    self._networks = await self._read_networks()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:
-                    failure = self._map_exception(err)
-                    self._finish_operation(False, failure)
-                    await self._emit_status()
-                    self._raise_failure(failure)
-                self._finish_operation(True)
-                await self._emit_status()
-                return {
-                    "status": await self._get_status(),
-                    "networks": [dict(item) for item in self._networks],
-                }
+            try:
+                async with self._snapshot_lock:
+                    # A connect/forget request may have been accepted while this
+                    # request waited for an in-flight passive snapshot.
+                    if self._is_busy():
+                        raise WifiFailure(
+                            "busy", "Another Wi-Fi operation is running"
+                        )
+                    elapsed = time.monotonic() - self._last_scan_at
+                    if self._last_scan_at and elapsed < SCAN_INTERVAL:
+                        return await self._refresh_network_snapshot_locked(
+                            emit=True, preserve_on_failure=True
+                        )
+                    async with self._operation_lock:
+                        self._new_operation("scan", None)
+                        await self._emit_status()
+                        try:
+                            await self._request_scan()
+                            await self._refresh_network_snapshot_locked(
+                                emit=False, preserve_on_failure=False
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as err:
+                            failure = self._map_exception(err)
+                            self._finish_operation(False, failure)
+                            await self._emit_status()
+                            self._raise_failure(failure)
+                        self._finish_operation(True)
+                        status = await self._get_status()
+                        self.server.send_event(
+                            "machine:wifi_state_changed", status
+                        )
+                        self._send_network_snapshot(status)
+                        return self._network_snapshot(status)
+            finally:
+                self._resume_pending_refresh()
         except WifiFailure as failure:
             self._raise_failure(failure)
 
@@ -384,10 +745,13 @@ class WifiManager:
             except UnicodeEncodeError:
                 ssid_size = 0
             if not ssid_size or ssid_size > 32 or "\x00" in ssid:
-                raise WifiFailure("invalid_request", "SSID must contain 1 to 32 bytes")
+                raise WifiFailure(
+                    "invalid_request", "SSID must contain 1 to 32 bytes"
+                )
             if security not in ("open", "wpa-psk"):
                 raise WifiFailure(
-                    "unsupported_security", "Only open and WPA/WPA2 Personal networks are supported"
+                    "unsupported_security",
+                    "Only open and WPA/WPA2 Personal networks are supported",
                 )
             if password is not None:
                 if security == "open":
@@ -395,16 +759,24 @@ class WifiManager:
                 elif not self._valid_psk(password):
                     raise WifiFailure(
                         "invalid_password",
-                        "WPA/WPA2 passwords must be 8 to 63 UTF-8 bytes or 64 hex digits"
+                        "WPA/WPA2 passwords must be 8 to 63 UTF-8 bytes or "
+                        "64 hex digits",
                     )
-            operation = self._new_operation("connect", ssid)
-            # Do not retain the caller's argument dictionary or password beyond the
-            # operation task.  The task clears its local reference in all paths.
-            self._operation_task = self.server.get_event_loop().create_task(
-                self._run_connect(ssid, security, password)
-            )
-            await self._emit_status()
-            return {"operation_id": operation["id"]}
+            async with self._snapshot_lock:
+                if self._is_busy():
+                    raise WifiFailure(
+                        "busy", "Another Wi-Fi operation is running"
+                    )
+                operation = self._new_operation("connect", ssid)
+                # Do not retain the caller's argument dictionary or password
+                # beyond the operation task.  The task clears its local reference
+                # in all paths.
+                self._operation_task = self.server.get_event_loop().create_task(
+                    self._run_connect(ssid, security, password)
+                )
+                self._operation_task.add_done_callback(self._on_operation_done)
+                await self._emit_status()
+                return {"operation_id": operation["id"]}
         except WifiFailure as failure:
             self._raise_failure(failure)
 
@@ -418,12 +790,18 @@ class WifiManager:
             ssid = web_request.get_args().get("ssid")
             if not isinstance(ssid, str) or not ssid:
                 raise WifiFailure("invalid_request", "SSID is required")
-            operation = self._new_operation("forget", ssid)
-            self._operation_task = self.server.get_event_loop().create_task(
-                self._run_forget(ssid)
-            )
-            await self._emit_status()
-            return {"operation_id": operation["id"]}
+            async with self._snapshot_lock:
+                if self._is_busy():
+                    raise WifiFailure(
+                        "busy", "Another Wi-Fi operation is running"
+                    )
+                operation = self._new_operation("forget", ssid)
+                self._operation_task = self.server.get_event_loop().create_task(
+                    self._run_forget(ssid)
+                )
+                self._operation_task.add_done_callback(self._on_operation_done)
+                await self._emit_status()
+                return {"operation_id": operation["id"]}
         except WifiFailure as failure:
             self._raise_failure(failure)
 
@@ -434,12 +812,12 @@ class WifiManager:
             await self.wifi.call_request_scan({})  # type: ignore
         except Exception as err:
             raise self._map_exception(err)
-        self._last_scan_at = time.monotonic()
         deadline = time.monotonic() + SCAN_TIMEOUT
         while time.monotonic() < deadline:
             await asyncio.sleep(.25)
             current: int = await self.wifi.get_last_scan()  # type: ignore
             if current != before:
+                self._last_scan_at = time.monotonic()
                 return
         raise WifiFailure("timeout", "Timed out while scanning for Wi-Fi networks")
 
@@ -447,10 +825,11 @@ class WifiManager:
         self._ensure_available()
         assert self.wifi is not None
         paths: List[str] = await self.wifi.call_get_all_access_points()  # type: ignore
+        await self._sync_access_point_watchers(paths)
         access_points: List[Dict[str, Any]] = []
         for path in paths:
             try:
-                ap = await self._get_interface(path, NM_AP_IFACE)
+                ap = await self._get_transient_interface(path, NM_AP_IFACE)
                 raw_ssid = await ap.get_ssid()  # type: ignore
                 ssid = self._decode_ssid(raw_ssid)
                 frequency: int = await ap.get_frequency()  # type: ignore
@@ -471,17 +850,25 @@ class WifiManager:
                 })
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                continue
+            except Exception as err:
+                # A path may legitimately disappear between enumeration and
+                # reading.  Other D-Bus failures mean this is not a complete
+                # snapshot and must reach the passive preserve-on-failure path.
+                if self._is_missing_object_error(err):
+                    continue
+                raise
         return access_points
 
-    async def _read_networks(self) -> List[Dict[str, Any]]:
+    async def _read_networks(
+        self, status: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         access_points = await self._get_access_points()
         profiles = await self._get_saved_profiles()
         saved_security: Dict[str, Set[str]] = {}
         for profile in profiles:
             saved_security.setdefault(profile["ssid"], set()).add(profile["security"])
-        status = await self._get_status()
+        if status is None:
+            status = await self._get_status()
         connected_ssid = status["ssid"] if status["connected"] else None
 
         grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -521,6 +908,12 @@ class WifiManager:
     async def _run_connect(
         self, ssid: str, security: str, password: Optional[str]
     ) -> None:
+        async with self._snapshot_lock:
+            await self._run_connect_locked(ssid, security, password)
+
+    async def _run_connect_locked(
+        self, ssid: str, security: str, password: Optional[str]
+    ) -> None:
         failure: Optional[WifiFailure] = None
         recovered_ssid: Optional[str] = None
         checkpoint: Optional[str] = None
@@ -541,7 +934,8 @@ class WifiManager:
                 ]
                 if not candidates:
                     raise WifiFailure(
-                        "network_not_found", "The selected 2.4 GHz network is no longer available"
+                        "network_not_found",
+                        "The selected 2.4 GHz network is no longer available",
                     )
                 target_ap = max(candidates, key=lambda item: item["strength"])
                 if security == "wpa-psk" and password is None and not matching:
@@ -567,7 +961,8 @@ class WifiManager:
                         ),
                     )["path"]
 
-                active_path: str = await self.nm.call_activate_connection(  # type: ignore
+                activate = self.nm.call_activate_connection  # type: ignore
+                active_path: str = await activate(
                     profile_path, self.device_path, target_ap["path"]
                 )
                 await self._wait_for_connection(active_path)
@@ -624,7 +1019,9 @@ class WifiManager:
                     await self._rollback_checkpoint(checkpoint, temp_profile)
                 except Exception:
                     failure = WifiFailure(
-                        "rollback_failed", "Connection failed and the previous network could not be restored"
+                        "rollback_failed",
+                        "Connection failed and the previous network could not "
+                        "be restored",
                     )
                 recovered_ssid = await self._wait_for_recovery(old_ssid)
                 if old_ssid is not None and recovered_ssid is None:
@@ -637,10 +1034,12 @@ class WifiManager:
                 if current["connected"]:
                     recovered_ssid = current["ssid"]
             self._finish_operation(False, failure, recovered_ssid)
-        await self._emit_status()
+        await self._emit_status(force_snapshot=failure is None)
 
     async def _wait_for_connection(self, active_path: str) -> None:
-        active = await self._get_interface(active_path, NM_ACTIVE_IFACE)
+        active = await self._get_transient_interface(
+            active_path, NM_ACTIVE_IFACE
+        )
         deadline = time.monotonic() + CONNECT_TIMEOUT
         while time.monotonic() < deadline:
             device_state, reason = await self._get_device_state_reason()
@@ -684,7 +1083,8 @@ class WifiManager:
         )
         if any(code != 0 for code in result.values()):
             raise WifiFailure(
-                "rollback_failed", "NetworkManager could not restore the previous network"
+                "rollback_failed",
+                "NetworkManager could not restore the previous network",
             )
         if temp_profile is not None:
             try:
@@ -692,7 +1092,9 @@ class WifiManager:
             except Exception:
                 pass
 
-    async def _wait_for_recovery(self, expected_ssid: Optional[str]) -> Optional[str]:
+    async def _wait_for_recovery(
+        self, expected_ssid: Optional[str]
+    ) -> Optional[str]:
         if expected_ssid is None:
             return None
         deadline = time.monotonic() + RECOVERY_TIMEOUT
@@ -704,6 +1106,10 @@ class WifiManager:
         return None
 
     async def _run_forget(self, ssid: str) -> None:
+        async with self._snapshot_lock:
+            await self._run_forget_locked(ssid)
+
+    async def _run_forget_locked(self, ssid: str) -> None:
         failure: Optional[WifiFailure] = None
         try:
             async with self._operation_lock:
@@ -714,12 +1120,17 @@ class WifiManager:
                 status = await self._get_status()
                 active_path: Optional[str] = None
                 if status["connected"] and status["ssid"] == ssid:
-                    active_path = await self.device.get_active_connection()  # type: ignore
+                    get_active = getattr(
+                        self.device, "get_active_connection"
+                    )
+                    active_path = await get_active()
                 for profile in profiles:
                     await self._delete_profile(profile["path"])
                 if active_path and active_path != "/":
                     try:
-                        await self.nm.call_deactivate_connection(active_path)  # type: ignore
+                        await self.nm.call_deactivate_connection(  # type: ignore
+                            active_path
+                        )
                     except Exception as err:
                         # Deleting the active profile normally deactivates it.
                         # Ignore only an ActiveConnection object that vanished
@@ -754,7 +1165,7 @@ class WifiManager:
             failure = self._map_exception(err)
         if failure is not None:
             self._finish_operation(False, failure)
-        await self._emit_status()
+        await self._emit_status(force_snapshot=failure is None)
 
     async def _add_unsaved_profile(
         self, ssid: str, security: str, password: Optional[str]
@@ -843,6 +1254,11 @@ class WifiManager:
         self._interface_cache.pop((path, NM_CONNECTION_IFACE), None)
 
     async def _get_status(self) -> Dict[str, Any]:
+        status = await self._read_status()
+        self._reconcile_networks(status)
+        return status
+
+    async def _read_status(self) -> Dict[str, Any]:
         base: Dict[str, Any] = {
             "interface": self.interface,
             "available": False,
@@ -857,21 +1273,36 @@ class WifiManager:
         }
         try:
             self._ensure_available()
-            assert self.nm is not None and self.device is not None and self.wifi is not None
+            assert self.nm is not None
+            assert self.device is not None
+            assert self.wifi is not None
             device_state: int = await self.device.get_state()  # type: ignore
             connectivity: int = await self.device.get_ip4_connectivity()  # type: ignore
             base["available"] = device_state > NM_DEVICE_STATE_UNAVAILABLE
-            base["connectivity"] = CONNECTIVITY_STATES.get(connectivity, "unknown")
+            base["connectivity"] = CONNECTIVITY_STATES.get(
+                connectivity, "unknown"
+            )
             if device_state == NM_DEVICE_STATE_ACTIVATED:
                 ap_path: str = await self.wifi.get_active_access_point()  # type: ignore
                 if ap_path and ap_path != "/":
-                    ap = await self._get_interface(ap_path, NM_AP_IFACE)
-                    base["ssid"] = self._decode_ssid(await ap.get_ssid())  # type: ignore
+                    ap = await self._get_transient_interface(
+                        ap_path, NM_AP_IFACE
+                    )
+                    raw_ssid = await ap.get_ssid()  # type: ignore
+                    base["ssid"] = self._decode_ssid(raw_ssid)
                     base["strength"] = int(await ap.get_strength())  # type: ignore
                     base["ip_address"] = await self._get_ipv4_address()
                     base["connected"] = bool(base["ssid"] and base["ip_address"])
+                else:
+                    await self._sync_ipv4_watcher(None)
+            else:
+                await self._sync_ipv4_watcher(None)
             operation = self._operation
-            if operation and operation["state"] == "running" and operation["type"] == "connect":
+            if (
+                operation and
+                operation["state"] == "running" and
+                operation["type"] == "connect"
+            ):
                 base["state"] = "connecting"
             elif base["connected"]:
                 base["state"] = "connected"
@@ -893,8 +1324,10 @@ class WifiManager:
         assert self.device is not None
         path: str = await self.device.get_ip4_config()  # type: ignore
         if not path or path == "/":
+            await self._sync_ipv4_watcher(None)
             return None
-        ip4 = await self._get_interface(path, NM_IP4_IFACE)
+        await self._sync_ipv4_watcher(path)
+        ip4 = await self._get_transient_interface(path, NM_IP4_IFACE)
         data: List[Dict[str, Variant]] = await ip4.get_address_data()  # type: ignore
         for address in data:
             value = self._variant_value(address.get("address"))
@@ -980,18 +1413,28 @@ class WifiManager:
         if isinstance(err, WifiFailure):
             return err
         message = self._safe_dbus_message(err).lower()
-        if any(token in message for token in ("not authorized", "notauthorized", "permission")):
+        if any(token in message for token in (
+            "not authorized", "notauthorized", "permission"
+        )):
             return WifiFailure(
                 "permission_denied", "NetworkManager denied the requested operation"
             )
-        if any(token in message for token in ("no secrets", "password", "psk")):
-            return WifiFailure("invalid_password", "NetworkManager rejected the password")
+        if any(token in message for token in (
+            "no secrets", "password", "psk"
+        )):
+            return WifiFailure(
+                "invalid_password", "NetworkManager rejected the password"
+            )
         if "not found" in message or "unknown connection" in message:
-            return WifiFailure("network_not_found", "The selected network is unavailable")
-        return WifiFailure("internal_error", "NetworkManager could not complete the operation")
+            return WifiFailure(
+                "network_not_found", "The selected network is unavailable"
+            )
+        return WifiFailure(
+            "internal_error", "NetworkManager could not complete the operation"
+        )
 
     @staticmethod
-    def _safe_dbus_message(err: Exception) -> str:
+    def _safe_dbus_message(err: BaseException) -> str:
         # D-Bus errors may contain object names but should never include request
         # settings.  Keep log output bounded and strip line breaks regardless.
         return str(err).replace("\n", " ")[:300]
