@@ -79,6 +79,16 @@ EXCLUDED_ARGS = ["_", "token", "access_token", "connection_id"]
 AUTHORIZED_EXTS = [".png", ".jpg"]
 DEFAULT_KLIPPY_LOG_PATH = "/tmp/klippy.log"
 
+
+def get_unproxied_remote_ip(request: Any) -> Optional[IPAddress]:
+    """Return the actual TCP peer, ignoring forwarded-IP headers."""
+    try:
+        stream = request.connection.stream
+        address = stream.socket.getpeername()
+        return parse_ip_address(address[0])
+    except Exception:
+        return None
+
 class MutableRouter(RuleRouter):
     def __init__(self, application: tornado.web.Application) -> None:
         self.application = application
@@ -672,7 +682,8 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
             if isinstance(args, dict):
                 if (
                     endpoint.startswith("/access") or
-                    endpoint.startswith("/machine/sudo/password")
+                    endpoint.startswith("/machine/sudo/password") or
+                    endpoint == "/machine/wifi/connect"
                 ):
                     resp = {key: "<sanitized>" for key in args}
             elif isinstance(args, str):
@@ -698,8 +709,9 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self._log_debug(f"HTTP Request::{req}", args)
         try:
             ip = parse_ip_address(self.request.remote_ip or "")
+            peer_ip = get_unproxied_remote_ip(self.request)
             result = await self.api_defintion.request(
-                args, req_type, transport, ip, self.current_user
+                args, req_type, transport, ip, self.current_user, peer_ip
             )
         except ServerError as e:
             if self.server.is_verbose_enabled():
@@ -734,6 +746,10 @@ class RPCHandler(AuthorizedRequestHandler, APITransport):
     @property
     def ip_addr(self) -> Optional[IPAddress]:
         return parse_ip_address(self.request.remote_ip or "")
+
+    @property
+    def peer_ip_addr(self) -> Optional[IPAddress]:
+        return get_unproxied_remote_ip(self.request)
 
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]

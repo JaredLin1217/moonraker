@@ -381,9 +381,14 @@ class Server:
         self.components[component_name] = component
 
     def register_notification(
-        self, event_name: str, notify_name: Optional[str] = None
+        self,
+        event_name: str,
+        notify_name: Optional[str] = None,
+        local_only: bool = False,
     ) -> None:
-        self.websocket_manager.register_notification(event_name, notify_name)
+        self.websocket_manager.register_notification(
+            event_name, notify_name, local_only=local_only
+        )
 
     def register_event_handler(
         self, event: str, callback: FlexCallback

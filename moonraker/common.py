@@ -224,10 +224,14 @@ class APIDefinition:
         request_type: RequestType,
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
-        user: Optional[UserInfo] = None
+        user: Optional[UserInfo] = None,
+        peer_ip_addr: Optional[IPAddress] = None
     ) -> Coroutine:
         return self.callback(
-            WebRequest(self.endpoint, args, request_type, transport, ip_addr, user)
+            WebRequest(
+                self.endpoint, args, request_type, transport, ip_addr, user,
+                peer_ip_addr
+            )
         )
 
     @property
@@ -319,6 +323,10 @@ class APITransport:
     @property
     def ip_addr(self) -> Optional[IPAddress]:
         return None
+
+    @property
+    def peer_ip_addr(self) -> Optional[IPAddress]:
+        return self.ip_addr
 
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
@@ -529,13 +537,15 @@ class WebRequest:
         request_type: RequestType = RequestType(0),
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
-        user: Optional[UserInfo] = None
+        user: Optional[UserInfo] = None,
+        peer_ip_addr: Optional[IPAddress] = None
     ) -> None:
         self.endpoint = endpoint
         self.args = args
         self.transport = transport
         self.request_type = request_type
         self.ip_addr: Optional[IPAddress] = ip_addr
+        self.peer_ip_addr: Optional[IPAddress] = peer_ip_addr
         self.current_user = user
 
     def get_endpoint(self) -> str:
@@ -560,6 +570,10 @@ class WebRequest:
 
     def get_ip_address(self) -> Optional[IPAddress]:
         return self.ip_addr
+
+    def get_peer_ip_address(self) -> Optional[IPAddress]:
+        """Return the actual TCP peer address before proxy headers."""
+        return self.peer_ip_addr
 
     def get_current_user(self) -> Optional[UserInfo]:
         return self.current_user
@@ -691,7 +705,8 @@ class JsonRPC:
         if isinstance(method, str):
             if (
                 method.startswith("access.") or
-                method == "machine.sudo.password"
+                method == "machine.sudo.password" or
+                method == "machine.wifi.connect"
             ):
                 self.sanitize_response = True
                 if params and isinstance(params, dict):
@@ -842,7 +857,8 @@ class JsonRPC:
         try:
             transport.screen_rpc_request(api_definition, request_type, params)
             result = await api_definition.request(
-                params, request_type, transport, transport.ip_addr, transport.user_info
+                params, request_type, transport, transport.ip_addr,
+                transport.user_info, transport.peer_ip_addr
             )
         except TypeError as e:
             return self.build_error(

@@ -16,6 +16,7 @@ from ..common import (
     TransportType,
 )
 from ..utils import ServerError, parse_ip_address
+from .application import get_unproxied_remote_ip
 
 # Annotation imports
 from typing import (
@@ -67,17 +68,18 @@ class WebsocketManager:
         self,
         event_name: str,
         notify_name: Optional[str] = None,
-        event_type: Optional[str] = None
+        event_type: Optional[str] = None,
+        local_only: bool = False,
     ) -> None:
         if notify_name is None:
             notify_name = event_name.split(':')[-1]
         if event_type == "logout":
             def notify_handler(*args):
-                self.notify_clients(notify_name, args)
+                self.notify_clients(notify_name, args, local_only=local_only)
                 self._process_logout(*args)
         else:
             def notify_handler(*args):
-                self.notify_clients(notify_name, args)
+                self.notify_clients(notify_name, args, local_only=local_only)
         self.server.register_event_handler(event_name, notify_handler)
 
     async def _handle_id_request(self, web_request: WebRequest) -> Dict[str, int]:
@@ -204,13 +206,19 @@ class WebsocketManager:
         self,
         name: str,
         data: Union[List, Tuple] = [],
-        mask: List[int] = []
+        mask: List[int] = [],
+        local_only: bool = False,
     ) -> None:
         msg: Dict[str, Any] = {'jsonrpc': "2.0", 'method': "notify_" + name}
         if data:
             msg['params'] = data
         for sc in list(self.clients.values()):
             if sc.uid in mask or sc.need_auth:
+                continue
+            if local_only and (
+                sc.ip_addr is None or not sc.ip_addr.is_loopback or
+                sc.peer_ip_addr is None or not sc.peer_ip_addr.is_loopback
+            ):
                 continue
             sc.queue_message(msg)
 
@@ -237,12 +245,17 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
     def initialize(self) -> None:
         self.on_create(self.settings['server'])
         self._ip_addr = parse_ip_address(self.request.remote_ip or "")
+        self._peer_ip_addr = get_unproxied_remote_ip(self.request)
         self.last_pong_time: float = self.eventloop.get_loop_time()
         self.cors_allowed: bool = False
 
     @property
     def ip_addr(self) -> Optional[IPAddress]:
         return self._ip_addr
+
+    @property
+    def peer_ip_addr(self) -> Optional[IPAddress]:
+        return self._peer_ip_addr
 
     @property
     def hostname(self) -> str:
