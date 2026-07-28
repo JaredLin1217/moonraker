@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 
 import pytest
@@ -12,6 +13,7 @@ from moonraker.components.wifi_manager import (
     NM_AP_SEC_KEY_MGMT_PSK,
     NM_AP_IFACE,
     NM_DEVICE_IFACE,
+    NM_DEVICE_STATE_UNAVAILABLE,
     NM_IP4_IFACE,
     WifiFailure,
     WifiManager,
@@ -52,6 +54,9 @@ class FakeServer:
     def add_warning(self, message, warning_id):
         self.warnings.append((message, warning_id))
 
+    def remove_warning(self, warning_id):
+        return None
+
 
 def manager_for_cache(networks=None):
     manager = WifiManager.__new__(WifiManager)
@@ -63,17 +68,31 @@ def manager_for_cache(networks=None):
     manager._operation_lock = asyncio.Lock()
     manager._snapshot_lock = asyncio.Lock()
     manager._watcher_lock = asyncio.Lock()
+    manager._adapter_lock = asyncio.Lock()
     manager._desired_ap_paths = set()
     manager._desired_ip4_path = None
     manager._operation_task = None
     manager._notify_task = None
     manager._refresh_pending = False
     manager._closed = False
+    manager._last_adapter_attempt = 0.0
     manager._property_handlers = []
     manager._signal_handlers = []
     manager._ap_property_handlers = {}
     manager._ip4_property_handler = None
     manager._interface_cache = {}
+    manager.nm = object()
+    manager.settings = object()
+    manager.device = object()
+    manager.wifi = object()
+    manager.device_path = "/device/wifi"
+    manager._permissions = {
+        "scan": False,
+        "network": False,
+        "settings": False,
+        "checkpoint": False,
+        "enable": False,
+    }
     return manager
 
 
@@ -243,6 +262,200 @@ def test_disconnected_status_clears_all_cached_connected_flags():
 
 
 @pytest.mark.asyncio
+async def test_disabled_radio_status_clears_visible_networks(monkeypatch):
+    manager = manager_for_cache([
+        network("Factory-A", 70, connected=True),
+    ])
+
+    class FakeNetworkManager:
+        async def get_wireless_enabled(self):
+            return False
+
+        async def get_wireless_hardware_enabled(self):
+            return True
+
+    class FakeDevice:
+        async def get_state(self):
+            return NM_DEVICE_STATE_UNAVAILABLE
+
+        async def get_ip4_connectivity(self):
+            return 1
+
+    manager.nm = FakeNetworkManager()
+    manager.device = FakeDevice()
+
+    async def fail_read_networks(status=None):
+        raise AssertionError("disabled Wi-Fi must not enumerate access points")
+
+    monkeypatch.setattr(manager, "_read_networks", fail_read_networks)
+
+    result = await manager._refresh_network_snapshot(
+        emit=True, preserve_on_failure=True
+    )
+
+    assert result["status"]["available"] is True
+    assert result["status"]["enabled"] is False
+    assert result["status"]["hardware_enabled"] is True
+    assert result["status"]["state"] == "disconnected"
+    assert result["networks"] == []
+    assert manager.server.events[-1] == (
+        "machine:wifi_networks_changed", result
+    )
+
+
+@pytest.mark.asyncio
+async def test_hardware_block_is_reported_separately():
+    manager = manager_for_cache()
+
+    class FakeNetworkManager:
+        async def get_wireless_enabled(self):
+            return True
+
+        async def get_wireless_hardware_enabled(self):
+            return False
+
+    class FakeDevice:
+        async def get_state(self):
+            return NM_DEVICE_STATE_UNAVAILABLE
+
+        async def get_ip4_connectivity(self):
+            return 1
+
+    manager.nm = FakeNetworkManager()
+    manager.device = FakeDevice()
+
+    status = await manager._read_status()
+
+    assert status["available"] is False
+    assert status["enabled"] is True
+    assert status["hardware_enabled"] is False
+    assert status["state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_set_enabled_updates_radio_and_emits_atomic_snapshot(monkeypatch):
+    manager = manager_for_cache([
+        network("Factory-A", 70, connected=True),
+    ])
+    manager._permissions["enable"] = True
+
+    class FakeNetworkManager:
+        enabled = True
+        requested = []
+
+        async def get_wireless_enabled(self):
+            return self.enabled
+
+        async def set_wireless_enabled(self, enabled):
+            self.requested.append(enabled)
+            self.enabled = enabled
+
+    class Request:
+        def get_boolean(self, name):
+            assert name == "enabled"
+            return False
+
+    nm = FakeNetworkManager()
+    manager.nm = nm
+
+    async def read_status():
+        return {
+            "interface": "wlp1s0",
+            "available": True,
+            "enabled": nm.enabled,
+            "hardware_enabled": True,
+            "state": "disconnected",
+            "connected": False,
+            "ssid": None,
+            "strength": None,
+            "ip_address": None,
+            "connectivity": "none",
+            "operation": None,
+            "last_error": None,
+        }
+
+    monkeypatch.setattr(manager, "_check_local", lambda request: None)
+    monkeypatch.setattr(manager, "_read_status", read_status)
+
+    result = await manager._handle_set_enabled(Request())
+
+    assert nm.requested == [False]
+    assert result["status"]["enabled"] is False
+    assert result["networks"] == []
+    assert [name for name, _ in manager.server.events] == [
+        "machine:wifi_state_changed",
+        "machine:wifi_networks_changed",
+    ]
+
+    manager.server.events.clear()
+    result = await manager._handle_set_enabled(Request())
+
+    assert nm.requested == [False]
+    assert result["status"]["enabled"] is False
+    assert [name for name, _ in manager.server.events] == [
+        "machine:wifi_state_changed",
+        "machine:wifi_networks_changed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_enabled_rejects_missing_permission_and_busy(monkeypatch):
+    manager = manager_for_cache()
+
+    class FakeNetworkManager:
+        async def get_wireless_enabled(self):
+            return True
+
+    class Request:
+        def get_boolean(self, name):
+            return False
+
+    manager.nm = FakeNetworkManager()
+    monkeypatch.setattr(manager, "_check_local", lambda request: None)
+
+    with pytest.raises(RuntimeError, match="permission_denied"):
+        await manager._handle_set_enabled(Request())
+
+    manager._permissions["enable"] = True
+    await manager._operation_lock.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="busy"):
+            await manager._handle_set_enabled(Request())
+    finally:
+        manager._operation_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_set_enabled_rejects_non_local_request():
+    manager = manager_for_cache()
+
+    class RemoteRequest:
+        def get_ip_address(self):
+            return ipaddress.ip_address("192.0.2.20")
+
+        def get_peer_ip_address(self):
+            return ipaddress.ip_address("127.0.0.1")
+
+    with pytest.raises(RuntimeError, match="permission_denied"):
+        await manager._handle_set_enabled(RemoteRequest())
+
+
+@pytest.mark.asyncio
+async def test_set_enabled_timeout_is_reported(monkeypatch):
+    manager = manager_for_cache()
+
+    class FakeNetworkManager:
+        async def get_wireless_enabled(self):
+            return False
+
+    manager.nm = FakeNetworkManager()
+    monkeypatch.setattr(wifi_module, "SET_ENABLED_TIMEOUT", 0.0)
+
+    with pytest.raises(WifiFailure, match="Timed out"):
+        await manager._wait_for_enabled(True)
+
+
+@pytest.mark.asyncio
 async def test_scan_cooldown_rebuilds_networkmanager_cache(monkeypatch):
     manager = manager_for_cache([
         network("Factory-A", 80, connected=True),
@@ -265,8 +478,12 @@ async def test_scan_cooldown_rebuilds_networkmanager_cache(monkeypatch):
         assert received_status == status
         return [network("Factory-B", 65, connected=True)]
 
+    async def ensure_enabled():
+        return None
+
     monkeypatch.setattr(manager, "_check_local", lambda request: None)
     monkeypatch.setattr(manager, "_ensure_available", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_enabled", ensure_enabled)
     monkeypatch.setattr(manager, "_read_status", read_status)
     monkeypatch.setattr(manager, "_read_networks", read_networks)
 
@@ -456,8 +673,12 @@ async def test_connect_is_not_announced_until_inflight_snapshot_finishes(
         operation_started.set()
         await operation_release.wait()
 
+    async def ensure_enabled():
+        return None
+
     monkeypatch.setattr(manager, "_check_local", lambda request: None)
     monkeypatch.setattr(manager, "_ensure_available", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_enabled", ensure_enabled)
     monkeypatch.setattr(manager, "_emit_status", emit_status)
     monkeypatch.setattr(manager, "_run_connect", run_connect)
 
@@ -990,7 +1211,7 @@ async def test_component_init_failure_removes_partially_installed_handlers(
 
     await manager.component_init()
 
-    assert manager._closed is True
+    assert manager._closed is False
     assert manager.nm is None
     assert manager.settings is None
     assert manager.device is None
@@ -1012,6 +1233,48 @@ async def test_component_init_failure_removes_partially_installed_handlers(
     assert manager._ip4_property_handler is None
     assert manager._interface_cache == {}
     assert manager.server.warnings[-1][1] == "wifi_manager_adapter"
+
+    async def recover_adapter(*, emit):
+        manager.nm = object()
+        manager.settings = object()
+        manager.device = object()
+        manager.wifi = object()
+        manager.device_path = "/device/recovered"
+        return True
+
+    monkeypatch.setattr(manager, "_bind_adapter", recover_adapter)
+
+    assert await manager._ensure_adapter(force=True) is True
+    assert manager._adapter_is_bound() is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_networkmanager_loss_invalidates_binding(monkeypatch):
+    manager = manager_for_cache()
+
+    class MissingNetworkManager:
+        async def get_wireless_enabled(self):
+            raise RuntimeError("The name has no owner")
+
+    manager.nm = MissingNetworkManager()
+
+    status = await manager._read_status()
+
+    assert status["available"] is False
+    assert status["enabled"] is False
+    assert manager._adapter_is_bound() is False
+
+    async def recover_adapter(*, emit):
+        manager.nm = object()
+        manager.settings = object()
+        manager.device = object()
+        manager.wifi = object()
+        manager.device_path = "/device/recovered"
+        return True
+
+    monkeypatch.setattr(manager, "_bind_adapter", recover_adapter)
+
+    assert await manager._ensure_adapter(force=True) is True
 
 
 @pytest.mark.asyncio

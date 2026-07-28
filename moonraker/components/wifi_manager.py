@@ -70,6 +70,8 @@ CONNECT_TIMEOUT = 30.0
 CHECKPOINT_TIMEOUT = 45
 RECOVERY_TIMEOUT = 15.0
 PASSIVE_REFRESH_DELAY = .25
+ADAPTER_RETRY_INTERVAL = 5.0
+SET_ENABLED_TIMEOUT = 5.0
 
 CONNECTIVITY_STATES = {
     0: "unknown",
@@ -128,6 +130,7 @@ class WifiManager:
         self._operation_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
         self._watcher_lock = asyncio.Lock()
+        self._adapter_lock = asyncio.Lock()
         self._desired_ap_paths: Set[str] = set()
         self._desired_ip4_path: Optional[str] = None
         self._operation_task: Optional[asyncio.Task] = None
@@ -135,6 +138,7 @@ class WifiManager:
         self._refresh_pending = False
         self._closed = False
         self._last_scan_at = 0.0
+        self._last_adapter_attempt = 0.0
         self._networks: List[Dict[str, Any]] = []
         self._operation: Optional[Dict[str, Any]] = None
         self._last_error: Optional[Dict[str, Any]] = None
@@ -143,6 +147,7 @@ class WifiManager:
             "network": False,
             "settings": False,
             "checkpoint": False,
+            "enable": False,
         }
 
         self.server.register_endpoint(
@@ -157,6 +162,11 @@ class WifiManager:
         self.server.register_endpoint(
             "/machine/wifi/forget", RequestType.POST, self._handle_forget
         )
+        self.server.register_endpoint(
+            "/machine/wifi/set_enabled",
+            RequestType.POST,
+            self._handle_set_enabled,
+        )
         self.server.register_notification(
             "machine:wifi_state_changed", local_only=True
         )
@@ -165,12 +175,53 @@ class WifiManager:
         )
 
     async def component_init(self) -> None:
+        await self._ensure_adapter(force=True, emit=False)
+
+    def _adapter_is_bound(self) -> bool:
+        return (
+            all(
+                obj is not None
+                for obj in (self.nm, self.settings, self.device, self.wifi)
+            ) and
+            self.device_path is not None
+        )
+
+    async def _ensure_adapter(
+        self, *, force: bool = False, emit: bool = True
+    ) -> bool:
+        if self._closed:
+            return False
+        if self._adapter_is_bound():
+            return True
+        now = time.monotonic()
+        if (
+            not force and
+            self._last_adapter_attempt and
+            now - self._last_adapter_attempt < ADAPTER_RETRY_INTERVAL
+        ):
+            return False
+        async with self._adapter_lock:
+            if self._closed:
+                return False
+            if self._adapter_is_bound():
+                return True
+            now = time.monotonic()
+            if (
+                not force and
+                self._last_adapter_attempt and
+                now - self._last_adapter_attempt < ADAPTER_RETRY_INTERVAL
+            ):
+                return False
+            self._last_adapter_attempt = now
+            return await self._bind_adapter(emit=emit)
+
+    async def _bind_adapter(self, *, emit: bool) -> bool:
         if not self.dbus_mgr.is_connected():
             self.server.add_warning(
                 "[wifi_manager]: D-Bus is unavailable; Wi-Fi control is disabled",
                 "wifi_manager_dbus"
             )
-            return
+            return False
         try:
             self._permissions["scan"] = await self.dbus_mgr.check_permission(
                 "org.freedesktop.NetworkManager.wifi.scan",
@@ -187,6 +238,10 @@ class WifiManager:
             self._permissions["checkpoint"] = await self.dbus_mgr.check_permission(
                 "org.freedesktop.NetworkManager.checkpoint-rollback",
                 "Safe Wi-Fi connection rollback will be disabled"
+            )
+            self._permissions["enable"] = await self.dbus_mgr.check_permission(
+                "org.freedesktop.NetworkManager.enable-disable-wifi",
+                "Local Wi-Fi radio control will be disabled"
             )
             self.nm = await self._get_interface(NM_PATH, NM_IFACE)
             self.settings = await self._get_interface(
@@ -216,15 +271,16 @@ class WifiManager:
                 self._on_connection_removed,
             )
             await self._refresh_network_snapshot(
-                emit=False, preserve_on_failure=True
+                emit=emit, preserve_on_failure=True
             )
+            if not self._adapter_is_bound():
+                raise RuntimeError("NetworkManager adapter binding was lost")
+            self.server.remove_warning("wifi_manager_dbus")
+            self.server.remove_warning("wifi_manager_adapter")
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            # Initialization is not retried.  Stop callbacks before disabling
-            # the adapter so a partially installed signal set cannot continue
-            # scheduling work for the lifetime of the component.
-            self._closed = True
             notify_task = self._notify_task
             if notify_task is not None:
                 if not notify_task.done():
@@ -233,17 +289,21 @@ class WifiManager:
                     await notify_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            await self._remove_dbus_handlers()
+            await self._reset_adapter()
             logging.info(
                 "[wifi_manager]: Unable to initialize NetworkManager adapter %s: %s",
                 self.interface, self._safe_dbus_message(err)
             )
-            self.nm = self.settings = self.device = self.wifi = None
-            self.device_path = None
             self.server.add_warning(
                 f"[wifi_manager]: Wi-Fi adapter '{self.interface}' is unavailable",
                 "wifi_manager_adapter"
             )
+            return False
+
+    async def _reset_adapter(self) -> None:
+        await self._remove_dbus_handlers()
+        self.nm = self.settings = self.device = self.wifi = None
+        self.device_path = None
 
     async def close(self) -> None:
         self._closed = True
@@ -258,7 +318,7 @@ class WifiManager:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        await self._remove_dbus_handlers()
+        await self._reset_adapter()
         self._refresh_pending = False
 
     async def _remove_dbus_handlers(self) -> None:
@@ -515,6 +575,11 @@ class WifiManager:
         )
 
     def _reconcile_networks(self, status: Dict[str, Any]) -> bool:
+        if status.get("enabled") is False:
+            if not self._networks:
+                return False
+            self._networks = []
+            return True
         connected_ssid = (
             status.get("ssid") if status.get("connected") else None
         )
@@ -555,30 +620,33 @@ class WifiManager:
     ) -> Dict[str, Any]:
         status = await self._read_status()
         changed = False
-        try:
-            networks = await self._read_networks(status)
-        except asyncio.CancelledError:
-            raise
-        except Exception as err:
-            if not preserve_on_failure:
-                raise
-            # Keep the last complete AP/profile snapshot.  Live connection flags
-            # may still be reconciled safely, and an operation error must not be
-            # replaced by a passive cache-read failure.
+        if status.get("enabled") is False:
             changed = self._reconcile_networks(status)
-            logging.info(
-                "[wifi_manager]: Unable to refresh the passive Wi-Fi cache: %s",
-                self._safe_dbus_message(err),
-            )
         else:
-            previous_networks = self._networks
-            self._networks = networks
-            # The strongest AP returned for an SSID is not necessarily the AP
-            # NetworkManager is currently using.  Always apply the live status
-            # after rebuilding the cache so the atomic snapshot carries the
-            # active AP's strength as well as the correct connected row.
-            self._reconcile_networks(status)
-            changed = self._networks != previous_networks
+            try:
+                networks = await self._read_networks(status)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                if not preserve_on_failure:
+                    raise
+                # Keep the last complete AP/profile snapshot.  Live connection
+                # flags may still be reconciled safely, and an operation error
+                # must not be replaced by a passive cache-read failure.
+                changed = self._reconcile_networks(status)
+                logging.info(
+                    "[wifi_manager]: Unable to refresh the passive Wi-Fi cache: %s",
+                    self._safe_dbus_message(err),
+                )
+            else:
+                previous_networks = self._networks
+                self._networks = networks
+                # The strongest AP returned for an SSID is not necessarily the AP
+                # NetworkManager is currently using.  Always apply the live status
+                # after rebuilding the cache so the atomic snapshot carries the
+                # active AP's strength as well as the correct connected row.
+                self._reconcile_networks(status)
+                changed = self._networks != previous_networks
         if emit:
             self.server.send_event("machine:wifi_state_changed", status)
             if changed:
@@ -613,6 +681,16 @@ class WifiManager:
                 "adapter_unavailable",
                 f"Wi-Fi adapter '{self.interface}' is unavailable",
             )
+
+    async def _ensure_enabled(self) -> None:
+        self._ensure_available()
+        assert self.nm is not None
+        try:
+            enabled: bool = await self.nm.get_wireless_enabled()  # type: ignore
+        except Exception as err:
+            raise self._map_exception(err)
+        if not enabled:
+            raise WifiFailure("adapter_unavailable", "Wi-Fi is disabled")
 
     def _ensure_permissions(self, *permissions: str) -> None:
         if not all(self._permissions.get(name, False) for name in permissions):
@@ -660,6 +738,7 @@ class WifiManager:
 
     async def _handle_status(self, web_request: WebRequest) -> Dict[str, Any]:
         self._check_local(web_request)
+        await self._ensure_adapter()
         # Status polling must remain responsive throughout a connect/forget
         # operation, which intentionally owns the snapshot lock for its full
         # lifetime.  The operation itself publishes the authoritative snapshots.
@@ -678,7 +757,9 @@ class WifiManager:
     async def _handle_scan(self, web_request: WebRequest) -> Dict[str, Any]:
         self._check_local(web_request)
         try:
+            await self._ensure_adapter(force=True)
             self._ensure_available()
+            await self._ensure_enabled()
             self._ensure_permissions("scan")
             if self._is_busy():
                 raise WifiFailure("busy", "Another Wi-Fi operation is running")
@@ -725,7 +806,9 @@ class WifiManager:
     async def _handle_connect(self, web_request: WebRequest) -> Dict[str, str]:
         self._check_local(web_request)
         try:
+            await self._ensure_adapter(force=True)
             self._ensure_available()
+            await self._ensure_enabled()
             self._ensure_permissions("network", "settings", "checkpoint")
             if self._is_busy():
                 raise WifiFailure("busy", "Another Wi-Fi operation is running")
@@ -783,6 +866,7 @@ class WifiManager:
     async def _handle_forget(self, web_request: WebRequest) -> Dict[str, str]:
         self._check_local(web_request)
         try:
+            await self._ensure_adapter(force=True)
             self._ensure_available()
             self._ensure_permissions("network", "settings")
             if self._is_busy():
@@ -804,6 +888,62 @@ class WifiManager:
                 return {"operation_id": operation["id"]}
         except WifiFailure as failure:
             self._raise_failure(failure)
+
+    async def _handle_set_enabled(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        self._check_local(web_request)
+        enabled = bool(web_request.get_boolean("enabled"))
+        try:
+            await self._ensure_adapter(force=True)
+            self._ensure_available()
+            self._ensure_permissions("enable")
+            if self._is_busy():
+                raise WifiFailure("busy", "Another Wi-Fi operation is running")
+            try:
+                async with self._snapshot_lock:
+                    if self._is_busy():
+                        raise WifiFailure(
+                            "busy", "Another Wi-Fi operation is running"
+                        )
+                    async with self._operation_lock:
+                        assert self.nm is not None
+                        current: bool = await (  # type: ignore
+                            self.nm.get_wireless_enabled()
+                        )
+                        if current != enabled:
+                            await self.nm.set_wireless_enabled(enabled)  # type: ignore
+                            await self._wait_for_enabled(enabled)
+                        self._last_error = None
+                        status = await self._read_status()
+                        self._reconcile_networks(status)
+                        self.server.send_event(
+                            "machine:wifi_state_changed", status
+                        )
+                        self._send_network_snapshot(status)
+                        return self._network_snapshot(status)
+            finally:
+                self._resume_pending_refresh()
+                if enabled:
+                    self._schedule_notification()
+        except WifiFailure as failure:
+            self._raise_failure(failure)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._raise_failure(self._map_exception(err))
+
+    async def _wait_for_enabled(self, enabled: bool) -> None:
+        assert self.nm is not None
+        deadline = time.monotonic() + SET_ENABLED_TIMEOUT
+        while time.monotonic() < deadline:
+            current: bool = await self.nm.get_wireless_enabled()  # type: ignore
+            if current == enabled:
+                return
+            await asyncio.sleep(.1)
+        raise WifiFailure(
+            "timeout", "Timed out while changing the Wi-Fi radio state"
+        )
 
     async def _request_scan(self) -> None:
         assert self.wifi is not None
@@ -1262,6 +1402,8 @@ class WifiManager:
         base: Dict[str, Any] = {
             "interface": self.interface,
             "available": False,
+            "enabled": False,
+            "hardware_enabled": False,
             "state": "unavailable",
             "connected": False,
             "ssid": None,
@@ -1276,13 +1418,25 @@ class WifiManager:
             assert self.nm is not None
             assert self.device is not None
             assert self.wifi is not None
+            wireless_enabled: bool = (  # type: ignore
+                await self.nm.get_wireless_enabled()
+            )
+            hardware_enabled: bool = (  # type: ignore
+                await self.nm.get_wireless_hardware_enabled()
+            )
             device_state: int = await self.device.get_state()  # type: ignore
             connectivity: int = await self.device.get_ip4_connectivity()  # type: ignore
-            base["available"] = device_state > NM_DEVICE_STATE_UNAVAILABLE
+            base["available"] = hardware_enabled
+            base["enabled"] = wireless_enabled
+            base["hardware_enabled"] = hardware_enabled
             base["connectivity"] = CONNECTIVITY_STATES.get(
                 connectivity, "unknown"
             )
-            if device_state == NM_DEVICE_STATE_ACTIVATED:
+            if (
+                wireless_enabled and
+                hardware_enabled and
+                device_state == NM_DEVICE_STATE_ACTIVATED
+            ):
                 ap_path: str = await self.wifi.get_active_access_point()  # type: ignore
                 if ap_path and ap_path != "/":
                     ap = await self._get_transient_interface(
@@ -1299,6 +1453,12 @@ class WifiManager:
                 await self._sync_ipv4_watcher(None)
             operation = self._operation
             if (
+                not hardware_enabled
+            ):
+                base["state"] = "unavailable"
+            elif not wireless_enabled:
+                base["state"] = "disconnected"
+            elif (
                 operation and
                 operation["state"] == "running" and
                 operation["type"] == "connect"
@@ -1316,8 +1476,9 @@ class WifiManager:
                 base["state"] = "connecting"
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as err:
+            if self._is_adapter_binding_error(err):
+                await self._reset_adapter()
         return base
 
     async def _get_ipv4_address(self) -> Optional[str]:
@@ -1353,6 +1514,19 @@ class WifiManager:
             return int(path.rsplit("/", 1)[-1])
         except (TypeError, ValueError):
             return -1
+
+    @classmethod
+    def _is_adapter_binding_error(cls, err: Exception) -> bool:
+        message = cls._safe_dbus_message(err).lower()
+        return any(token in message for token in (
+            "interface not found on this object",
+            "name has no owner",
+            "no such object",
+            "not provided by any .service files",
+            "serviceunknown",
+            "transport endpoint is not connected",
+            "unknown object",
+        ))
 
     @classmethod
     def _is_missing_object_error(cls, err: Exception) -> bool:

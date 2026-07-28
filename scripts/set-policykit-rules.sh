@@ -33,6 +33,7 @@ add_polkit_legacy_rules()
     ACTIONS="${ACTIONS};org.freedesktop.login1.halt"
     ACTIONS="${ACTIONS};org.freedesktop.login1.halt-multiple-sessions"
     ACTIONS="${ACTIONS};org.freedesktop.packagekit.*"
+    ACTIONS="${ACTIONS};org.freedesktop.NetworkManager.enable-disable-wifi"
     sudo /bin/sh -c "cat > ${RULE_FILE}" << EOF
 [moonraker permissions]
 Identity=unix-user:$USER
@@ -66,8 +67,7 @@ add_polkit_rules()
     report_status "Installing PolicyKit Rules to ${RULE_FILE}..."
     MOONRAKER_GID=$( getent group moonraker-admin | awk -F: '{printf "%d", $3}' )
     sudo /bin/sh -c "cat > ${RULE_FILE}" << EOF
-// Allow Moonraker User to manage systemd units, reboot and shutdown
-// the system
+// Allow Moonraker User to manage system services and the local Wi-Fi radio
 polkit.addRule(function(action, subject) {
     if ((action.id == "org.freedesktop.systemd1.manage-units" ||
          action.id == "org.freedesktop.login1.power-off" ||
@@ -76,6 +76,7 @@ polkit.addRule(function(action, subject) {
          action.id == "org.freedesktop.login1.reboot-multiple-sessions" ||
          action.id == "org.freedesktop.login1.halt" ||
          action.id == "org.freedesktop.login1.halt-multiple-sessions" ||
+         action.id == "org.freedesktop.NetworkManager.enable-disable-wifi" ||
          action.id.startsWith("org.freedesktop.packagekit.")) &&
         subject.user == "$USER") {
         // Only allow processes with the "moonraker-admin" supplementary group
