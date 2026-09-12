@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog].
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-25
+
+### Changed
+- **build**: Switch to uv for project management
+- **build**: Drop packaging support for EOL versions of python (3.7, 3.8, 3.9).
+  This change does not impact the minimum version when running from source.
+- **build**: Bump tornado to version 6.5.8
+- **build**: Bump apprise to version 1.13.0
+- **build**: Bump pillow to version 12.3.0
+- **build**: Bump streaming-form-data to version 2.1.0
+- **build**: Bump zeroconf to version 0.150.0
+- **build**: Bump dbus-fast to version 5.0.22
+- **build**: Bump importlib_metadata to version 9.0.0
+- **build**: Bump mkdocs-material to version 9.7.7 (docs requirement)
+- **build**: Bump pymdown-extensions to version 11.0.2 (docs requirement)
+- **build**: Bump pdm-backend to 2.4.9
+- **machine**: Support standard reboot and shutdown commands
+- **assets**: Clarify welcome message on landing page
+- **git_deploy**: Refactor git repo status refresh
+- **Authorization**:  Failed API Key comparisons now return a 401 status code.
+  Previously failed comparisons would proceed to Trusted Client auth.
+- **Websockets**:  Failed JWT and API Key authentication attempts will now
+  revoke "trusted client" authorization if present.
+
+### Added
+- **metadata**: Auto-detect forks of PrusaSlicer.
+- **metadata**: Add `printer_vendor`, `printer_model`, `printer_variant`,
+  and `profile_version` parsing for PrusaSlicer derivatives.
+- **git_deploy**: Add a `repo_detected` field for git repos in the status
+  API response
+- **announcements**:  Add the `enable_moonlight` configuration option that
+  may be used to enable/disable requests to retrieve announcement feeds from
+  the Moonlight GitHub repository.
+- **application**: Added a `use_xheaders` option that may be set to False to
+  disable X-Header IP parsing for instances intended to be exclusively accessed
+  directly.
+
+### Fixed
+- **mqtt**: Fixed TLS for version 2.0+ paho mqtt clients
+- **authorization**: Only perform password authentication on locally
+  created users
+- **git_deploy**:  Detect a detached HEAD state when no branches are available.
+- **authorization**:  Trusted Client authorization now validates both the forwarded
+  IP address and the proxy IP address when applicable.
+- **Authorization**:  Constant time comparisons are now used to validate credentials.
+
+## [0.10.0] - 2026-01-21
+
 ### Changed
 - **data_store**: Store multi-line gcode commands in a single entry.
 - **dbus_manager**: Replace unmaintained `dbus-next` requirement with
@@ -32,16 +80,24 @@ The format is based on [Keep a Changelog].
   support the deprecated `full` and `client` endpoints for compatibility
   with older API versions.
 - **simplyprint**: Improve job progress calculation.
-- **build**: Bump PDM-Backend to 2.4.3.
-- **build**: Bump Apprise to 1.9.2
-- **build**: Bump Tornado to 6.5.1
+- **build**: Bump PDM-Backend to 2.4.4.
+- **build**: Bump Apprise to 1.9.6
+- **build**: Bump Tornado to 6.5.4
 - **build**: Bump Streaming-form-data to 1.19.1
-- **build**: Bump Jinja2 to 3.1.5
-- **build**: Bump dbus-fast to 2.44.1
+- **build**: Bump Jinja2 to 3.1.6
+- **build**: Bump dbus-fast to 3.1.2
+- **build**: Bump pillow to 12.1.0
+- **build**: Bump inotify-simple to 2.0.1
+- **build**: Bump paho-mqtt to 2.1.0
+- **build**: Bump zeroconf to 0.148.0
+- **build**: bump importlib_metadata to 8.7.1
+- **metadata**: Export `filament_name` and `filament_type` values as arrays
+  when more than one value is present.
 
 ### Fixed
-- **python_deploy**: fix "dev" channel updates for GitHub sources.
-- **python_deploy**: fix release rollbacks.
+- **python_deploy**: Fix "dev" channel updates for GitHub sources.
+- **python_deploy**: Fix release rollbacks.
+- **python_deploy**: Fix support for PyPI beta updates.
 - **mqtt**: Publish the result of the Klipper status subscription request.
   This fixes issues with MQTT clients missing the initial status updates
   after Klippy restarts.
@@ -50,7 +106,9 @@ The format is based on [Keep a Changelog].
 - **spoolman**: Use the default websocket ping timeout.  Disable pinging for
   versions of Tornado prior to 6.5.0.
 - **application**: Disable pinging for versions of Tornado prior to 6.5.0.
-
+- **system_deploy**: Handle the "package_severity" bits for Info Enum objects.
+- **spoolman**: Fix filament tracking for MMU devices.
+- **ldap**: Fix filter injection vulnerability.
 
 ### Added
 - **application**: Verify that a filename is present when parsing the
@@ -73,6 +131,7 @@ The format is based on [Keep a Changelog].
 - **update_manager**:  Add support for updating `executable` binaries.
 - **update_manager**:  Added a `report_anomalies` option for git, web, and zip
   types.
+- **git_deploy**: Add support for relative `gitdir` file paths.
 - **analysis**: Initial support for gcode file time analysis using
   [Klipper Estimator](https://github.com/Annex-Engineering/klipper_estimator).
 - **power**: Added the ability to discard unwanted responses for MQTT
@@ -83,6 +142,14 @@ The format is based on [Keep a Changelog].
 - **power**: Added `restrict_action_processing` option.  When set to `False`,
   post toggle actions such as restarting Klippy and controlling bound services
   are run when an external power event is detected.
+- **simplyprint**:  Forward `exclude_object` status data from Klipper.
+- **td1**: Add support for interfacing with [TD-1](https://ajax-3d.com/) devices.
+- **metadata**:  Add generic support for most PrusaSlicer forks.
+- **proc_stats**:  Add support for x86-64 (Intel and AMD) temperature sensors.
+- **ldap**:  Add support for servers such as OpenDJ that use the `isMemberOf`
+  virtual attribute to report group membership.
+- **ldap**:  Add `check_dn_case` option to disable case-sensitive group DN
+  comparisons if desired.
 
 ## [0.9.3] - 2024-09-05
 
@@ -300,7 +367,9 @@ The format is based on [Keep a Changelog].
 [api_changes.md]: api_changes.md
 
 <!-- Versions -->
-[unreleased]: https://github.com/Arksine/moonraker/compare/v0.9.3...HEAD
+[unreleased]: https://github.com/Arksine/moonraker/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Arksine/moonraker/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/Arksine/moonraker/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/Arksine/moonraker/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/Arksine/moonraker/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/Arksine/moonraker/compare/v0.9.0...v0.9.1

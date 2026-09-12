@@ -23,7 +23,13 @@ from tornado.routing import Rule, PathMatches, RuleRouter
 from tornado.http1connection import HTTP1Connection
 from tornado.httpserver import HTTPServer
 from tornado.log import access_log
-from ..utils import ServerError, source_info, parse_ip_address
+from ..utils import (
+    ServerError,
+    source_info,
+    parse_ip_address,
+    get_proxy_ip,
+    check_request_proxied
+)
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -170,14 +176,19 @@ class PrimaryRouter(MutableRouter):
             log_method = access_log.warning
         else:
             log_method = access_log.error
-        request_time = 1000.0 * handler.request.request_time()
+        req = handler.request
+        request_time = 1000.0 * req.request_time()
         user: Optional[UserInfo] = handler.current_user
         username = "No User"
         if user is not None:
             username = user.username
+        proxy_ip = get_proxy_ip(req)
+        if proxy_ip is not None and check_request_proxied(req):
+            summary = f"{req.method} {req.uri} ({req.remote_ip} via {proxy_ip})"
+        else:
+            summary = f"{req.method} {req.uri} ({req.remote_ip})"
         log_method(
-            f"{status_code} {handler._request_summary()} "
-            f"[{username}] {request_time:.2f}ms"
+            f"{status_code} {summary} [{username}] {request_time:.2f}ms"
         )
 
 class InternalTransport(APITransport):
@@ -210,6 +221,7 @@ class MoonrakerApp:
             "/server/redirect",
             "/server/jsonrpc"
         ]
+        self.use_xheaders = config.getboolean("use_xheaders", True)
         self.max_upload_size = config.getint('max_upload_size', 1024)
         self.max_upload_size *= 1024 * 1024
 
@@ -322,7 +334,8 @@ class MoonrakerApp:
     def _create_http_server(
         self, port: int, address: str, **kwargs
     ) -> Optional[HTTPServer]:
-        args: Dict[str, Any] = dict(max_body_size=MAX_BODY_SIZE, xheaders=True)
+        args: Dict[str, Any]
+        args = dict(max_body_size=MAX_BODY_SIZE, xheaders=self.use_xheaders)
         args.update(kwargs)
         svr = HTTPServer(self.mutable_router, **args)
         try:
@@ -745,7 +758,7 @@ class RPCHandler(AuthorizedRequestHandler, APITransport):
 
     @property
     def ip_addr(self) -> Optional[IPAddress]:
-        return parse_ip_address(self.request.remote_ip or "")
+        return parse_ip_address(self.request.remote_ip)
 
     @property
     def peer_ip_addr(self) -> Optional[IPAddress]:
