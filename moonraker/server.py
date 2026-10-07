@@ -215,14 +215,29 @@ class Server:
         extm: ExtensionManager = self.lookup_component("extensions")
         await extm.start_unix_server()
 
+        # Give Klipper time to register its APIs before frontend connections.
+        # Keep the connection task alive if startup exceeds the grace period.
+        self.server_running = True
+        if connect_to_klippy:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self.klippy_connection.connect()),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logging.info(
+                    "Klipper startup is still pending; "
+                    "starting HTTP API while connection continues")
+
         # Start HTTP Server
         logging.info(
             f"Starting Moonraker on ({self.host}, {self.port}), "
             f"Hostname: {socket.gethostname()}")
-        self.moonraker_app.listen(self.host, self.port, self.ssl_port)
-        self.server_running = True
-        if connect_to_klippy:
-            self.klippy_connection.connect()
+        try:
+            self.moonraker_app.listen(self.host, self.port, self.ssl_port)
+        except Exception:
+            self.server_running = False
+            raise
 
     async def run_until_exit(self) -> None:
         await self.app_running_evt.wait()

@@ -396,6 +396,9 @@ class MQTTClient(APITransport):
             self.tb_offline_cache: deque = deque(maxlen=10000)
             _cache_dir = pathlib.Path.home() / "printer_data" / "cache"
             self.tb_cache_file: str = str(_cache_dir / "tb_offline_cache.json")
+            # --- TB resilience v2: 黑洞检测(PUBACK 存活信号) ---
+            self.tb_last_ack: float = 0.0
+            self.tb_blackhole_sec: float = 30.0
             self._tb_load_disk_cache()
 
         client_id: str = config.get("client_id", "")
@@ -567,6 +570,8 @@ class MQTTClient(APITransport):
                     f"MQTT: Subscribed to TB RPC topic: {self.tb_rpc_sub_topic}"
                 )
                 self.tb_connected = True
+                import time as _t
+                self.tb_last_ack = _t.time()
                 if self.tb_offline_cache:
                     self.eventloop.register_callback(self._tb_flush_cache)
             self.connect_evt.set()
@@ -606,6 +611,9 @@ class MQTTClient(APITransport):
                     user_data: Any,
                     msg_id: int
                     ) -> None:
+        if self.thingsboard_mode:
+            import time as _t
+            self.tb_last_ack = _t.time()
         pub_fut = self.pending_acks.pop(msg_id, None)
         if pub_fut is not None and not pub_fut.done():
             pub_fut.set_result(None)
@@ -860,7 +868,10 @@ class MQTTClient(APITransport):
                 self.timestamp_deque.append(ts)
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
-        if not status or not self.is_connected():
+        if not status:
+            return
+        # [TB_OFFLINE_CACHE_GATE] TB direct mode must feed its offline cache.
+        if not self.is_connected() and not self.thingsboard_mode:
             return
         if not self.status_interval:
             self._publish_status_update(status, eventtime)
@@ -973,6 +984,42 @@ class MQTTClient(APITransport):
             except Exception:
                 pass
 
+    def _tb_parse_layer_offsets(self, path):
+        """解析 gcode 每个 ;LAYER_CHANGE 行的 byte 起始偏移 (升序 list)。"""
+        offsets = []
+        try:
+            with open(path, "rb") as _fh:
+                _pos = 0
+                for _line in _fh:
+                    if _line.startswith(b";LAYER_CHANGE"):
+                        offsets.append(_pos)
+                    _pos += len(_line)
+        except Exception:
+            return []
+        return offsets
+
+    def _tb_inject_layer_info(self):
+        """用 ;LAYER_CHANGE 偏移 + 实时 file_position 二分反查当前层, 写入上报缓冲。
+
+        偏移仅在文件名变化时重解析 (缓存)。无偏移/无 file_position 则不写 (不伪造)。
+        """
+        import bisect as _bisect
+        buf = self.tb_buffer
+        path = buf.get("virtual_sdcard_file_path")
+        fpos = buf.get("virtual_sdcard_file_position")
+        if not path or fpos is None:
+            return
+        if getattr(self, "_tb_layer_path", None) != path:
+            self._tb_layer_path = path
+            self._tb_layer_offsets = self._tb_parse_layer_offsets(path)
+        offsets = getattr(self, "_tb_layer_offsets", None)
+        if not offsets:
+            return
+        buf["print_stats_total_layer"] = len(offsets)
+        cur = _bisect.bisect_right(offsets, int(fpos))
+        if cur > 0:
+            buf["print_stats_current_layer"] = cur
+
     def _publish_tb_telemetry(self, status: Dict[str, Any], eventtime: float) -> None:
         """Publish telemetry data in ThingsBoard format"""
         import time as _time
@@ -1000,6 +1047,14 @@ class MQTTClient(APITransport):
                     tb_key = f"{obj_name}_{key}"
                     self.tb_buffer[tb_key] = value
 
+        # 层信息: ;LAYER_CHANGE 偏移 + 实时 file_position 二分反查当前层
+        # (切片器无关; OrcaSlicer/PrusaSlicer/SuperSlicer 都写 ;LAYER_CHANGE)。
+        # 失败/无数据一律不写, 绝不影响主遥测上报。
+        try:
+            self._tb_inject_layer_info()
+        except Exception:
+            pass
+
         # Flush buffer based on interval
         now = _time.time()
         if now - self.tb_last_flush >= self.tb_flush_interval and self.tb_buffer:
@@ -1007,7 +1062,14 @@ class MQTTClient(APITransport):
                 "ts": int(_time.time() * 1000),
                 "values": self.tb_buffer.copy()
             }
-            if self.tb_connected:
+            if self.tb_connected and (now - self.tb_last_ack) > self.tb_blackhole_sec:
+                logging.warning(
+                    f"MQTT: TB blackhole, no PUBACK {now - self.tb_last_ack:.0f}s,"
+                    " caching + force reconnect")
+                self.tb_connected = False
+                self.tb_offline_cache.append(payload)
+                self.eventloop.register_callback(self._tb_force_reconnect)
+            elif self.tb_connected:
                 self.publish_topic(self.tb_telemetry_topic, payload, qos=1)
             else:
                 self.tb_offline_cache.append(payload)
@@ -1084,6 +1146,14 @@ class MQTTClient(APITransport):
             return
         logging.info("MQTT: TB forcing reconnect after broker-unavailable")
         self.connect_task = self.eventloop.create_task(self._do_reconnect())
+
+    def _tb_force_reconnect(self) -> None:
+        """黑洞断网: 强制断开卡死的 paho 连接, 触发既有重连流程。"""
+        try:
+            self.client.disconnect()
+        except Exception as e:
+            logging.warning(f"MQTT: TB force reconnect error: {e}")
+        self.eventloop.delay_callback(2., self._tb_start_reconnect)
 
 
     def get_instance_name(self) -> str:
