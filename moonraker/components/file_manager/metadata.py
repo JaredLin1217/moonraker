@@ -438,7 +438,7 @@ class PrusaSlicer(BaseSlicer):
             # Fall back to search by known alias (legacy regex search)
             known_aliases = [
                 "PrusaSlicer", "SuperSlicer", "OrcaSlicer", "MomentSlicer",
-                "InlongSlicer",
+                "InlongSlicer", "Infinity3dpSlicer",
                 "SliCR-3D", "A3dp-Slicer", "QIDISlicer"
             ]
             pattern = r"({ids})\s(.*)\son".format(ids="|".join(known_aliases))
