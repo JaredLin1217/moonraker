@@ -193,6 +193,7 @@ class History:
         self.server = config.get_server()
         self.file_manager: FileManager = self.server.lookup_component('file_manager')
         self.request_lock = Lock()
+        self.delete_callbacks = []
         FieldTracker.class_init(self)
         self.auxiliary_fields: List[HistoryFieldData] = []
         database: DBComp = self.server.lookup_component("database")
@@ -280,30 +281,55 @@ class History:
                 job = dict(result)
                 return {"job": self._prep_requested_job(job, job_id)}
             if req_type == RequestType.DELETE:
-                all = web_request.get_boolean("all", False)
-                if all:
-                    cursor = await self.history_table.execute(
-                        f"SELECT job_id FROM {HIST_TABLE} WHERE instance_id = ?",
-                        ("default",)
-                    )
-                    await cursor.set_arraysize(1000)
-                    deljobs = [f"{row[0]:06X}" for row in await cursor.fetchall()]
-                    async with self.history_table as tx:
-                        await tx.execute(
-                            f"DELETE FROM {HIST_TABLE} WHERE instance_id = ?",
-                            ("default",)
-                        )
-                    return {'deleted_jobs': deljobs}
-
-                job_id = web_request.get_str("uid")
-                async with self.history_table as tx:
-                    cursor = await tx.execute(
-                        f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (int(job_id, 16),)
-                    )
-                if cursor.rowcount < 1:
-                    raise self.server.error(f"Invalid job uid: {job_id}", 404)
-                return {'deleted_jobs': [job_id]}
+                all_jobs = web_request.get_boolean("all", False)
+                job_id = None if all_jobs else int(web_request.get_str("uid"), 16)
+                return await self._delete_requested_jobs(job_id, all_jobs)
             raise self.server.error("Invalid Request Method")
+
+    def register_delete_callback(self, callback) -> None:
+        """Callbacks perform SQL only, inside the history deletion transaction."""
+        self.delete_callbacks.append(callback)
+
+    async def _delete_requested_jobs(self, job_id, all_jobs=False):
+        if self.current_job is not None and (all_jobs or job_id == self.current_job_id):
+            raise self.server.error("Cannot delete an active or paused print job", 409)
+
+        def delete_transaction(conn):
+            # One worker callback prevents interleaving commits between deletion
+            # and extension cleanup. Do not use DELETE triggers: save_job uses REPLACE.
+            with conn:
+                if all_jobs:
+                    targets = conn.execute(
+                        "SELECT job_id,start_time FROM job_history WHERE instance_id=?",
+                        ("default",)
+                    ).fetchall()
+                    conn.execute("DELETE FROM job_history WHERE instance_id=?", ("default",))
+                else:
+                    targets = conn.execute(
+                        "SELECT job_id,start_time FROM job_history WHERE job_id=? AND instance_id=?",
+                        (job_id, "default")
+                    ).fetchall()
+                    if not targets:
+                        raise self.server.error(f"Invalid job uid: {job_id:06X}", 404)
+                    conn.execute("DELETE FROM job_history WHERE job_id=? AND instance_id=?", (job_id, "default"))
+                identities = [(row[0], row[1]) for row in targets]
+                for callback in self.delete_callbacks:
+                    callback(conn, identities, all_jobs)
+                # Mainsail task notes must not attach to reused numeric job IDs.
+                if all_jobs:
+                    conn.execute("DELETE FROM namespace_store WHERE namespace=?", ("history_notes",))
+                else:
+                    conn.executemany(
+                        "DELETE FROM namespace_store WHERE namespace=? AND key=?",
+                        [("history_notes", f"{identity[0]:06X}") for identity in identities]
+                    )
+                return [f"{identity[0]:06X}" for identity in identities]
+
+        deleted = await self.history_table.queue_callback(delete_transaction)
+        self.server.send_event("history:history_changed", {
+            "action": "deleted", "deleted_jobs": deleted, "all": all_jobs
+        })
+        return {"deleted_jobs": deleted}
 
     async def _handle_jobs_list(self,
                                 web_request: WebRequest
@@ -453,10 +479,8 @@ class History:
     async def delete_job(self, job_id: Union[int, str]) -> None:
         if isinstance(job_id, str):
             job_id = int(job_id, 16)
-        async with self.history_table as tx:
-            tx.execute(
-                f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
-            )
+        async with self.request_lock:
+            await self._delete_requested_jobs(job_id)
 
     async def finish_job(self, status: str, pstats: Dict[str, Any]) -> None:
         async with self.request_lock:
